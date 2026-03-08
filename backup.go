@@ -19,9 +19,20 @@ var embeddedFiles embed.FS
 
 func main() {
 	cmd := &cli.Command{
-		Name:   "create",
-		Usage:  "create a backup of a directory",
-		Action: createBackup,
+		Commands: []*cli.Command{
+			{
+
+				Name:   "create",
+				Usage:  "create a backup of one or more directories",
+				Action: createBackup,
+				Arguments: []cli.Argument{
+					&cli.StringArgs{
+						Name: "dirs",
+						Max:  -1,
+					},
+				},
+			},
+		},
 	}
 
 	if err := cmd.Run(context.Background(), os.Args); err != nil {
@@ -40,6 +51,12 @@ func createBackup(ctx context.Context, cmd *cli.Command) error {
 	} else if cfg == nil {
 		log.Printf("created missing config file: %s", configPath)
 		log.Printf("please fill in, then re-run")
+		return nil
+	}
+
+	dirs := cmd.StringArgs("dirs")
+	if len(dirs) == 0 {
+		log.Printf("please provide at least one directory to backup")
 		return nil
 	}
 
