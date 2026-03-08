@@ -1,0 +1,4 @@
+[gcs]
+project_id = "my-cool-project-id"
+bucket = "my-cool-bucket"
+prefix = "optional object prefix"
