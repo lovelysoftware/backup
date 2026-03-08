@@ -5,13 +5,20 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
+	"iter"
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 
 	"cloud.google.com/go/storage"
 	"github.com/BurntSushi/toml"
+	"github.com/restic/chunker"
 	"github.com/urfave/cli/v3"
+	"golang.org/x/sync/errgroup"
 )
 
 //go:embed default-config.toml
@@ -25,6 +32,18 @@ func main() {
 				Name:   "create",
 				Usage:  "create a backup of one or more directories",
 				Action: createBackup,
+				Flags: []cli.Flag{
+					&cli.IntFlag{
+						Name:  "cpus",
+						Usage: "number of cpus to use",
+						Value: max(runtime.NumCPU()-1, 1),
+					},
+					&cli.BoolFlag{
+						Name:  "ignore-hidden",
+						Usage: "whether to ignore hidden files or not",
+						Value: true,
+					},
+				},
 				Arguments: []cli.Argument{
 					&cli.StringArgs{
 						Name: "dirs",
@@ -60,7 +79,69 @@ func createBackup(ctx context.Context, cmd *cli.Command) error {
 		return nil
 	}
 
-	return errors.New("unimplemented")
+	cpus := cmd.Int("cpus")
+	if cpus == 0 {
+		return errors.New("--cpus must be non-zero")
+	}
+	ignoreHidden := cmd.Bool("ignore-hidden")
+
+	eg := new(errgroup.Group)
+	eg.SetLimit(cpus)
+
+	for _, dir := range dirs {
+		abs, err := filepath.Abs(dir)
+		if err != nil {
+			return fmt.Errorf("constructing absolute path for dir %s: %w", err)
+		}
+
+		if err := filepath.WalkDir(abs, func(path string, d fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+
+			// TODO this doesn't work on windows, see:
+			// https://stackoverflow.com/questions/70291933/how-to-detect-hidden-files-in-a-folder-in-go-cross-platform-approach
+			shouldSkip := ignoreHidden && strings.HasPrefix(filepath.Base(path), ".")
+			if d.IsDir() {
+				if shouldSkip {
+					return fs.SkipDir
+				} else {
+					return nil
+				}
+			} else if shouldSkip {
+				return nil
+			}
+
+			eg.Go(func() error {
+				f, err := os.Open(path)
+				if err != nil {
+					return fmt.Errorf("opening file at path %s: %w", path, err)
+				}
+				defer f.Close()
+
+				var numChunks int
+				for chk, err := range chunkFile(f) {
+					if err != nil {
+						return fmt.Errorf("chunking file %s: %w", path, err)
+					}
+					_ = chk
+					numChunks += 1
+				}
+
+				log.Printf("walking %s, found %d chunks\n", path, numChunks)
+				return nil
+			})
+			return nil
+		}); err != nil {
+			return fmt.Errorf("walking dir %s: %w", dir, err)
+		}
+	}
+
+	if err := eg.Wait(); err != nil {
+		return fmt.Errorf("chunking files: %w", err)
+	}
+
+	return nil
 }
 
 func connectToGCS(ctx context.Context) (*storage.Client, error) {
@@ -115,4 +196,30 @@ func loadConfig(path string) (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+func chunkFile(rdr io.Reader) iter.Seq2[[]byte, error] {
+	const (
+		minChunkSize uint = 512 << 10
+		maxChunkSize uint = 8 << 20
+		pol               = chunker.Pol(16194416975600741) // computed with chunker.RandomPolynomial
+	)
+	var (
+		chunkerInst = chunker.NewWithBoundaries(rdr, pol, minChunkSize, maxChunkSize)
+		data        = make([]byte, maxChunkSize)
+	)
+	return func(yield func([]byte, error) bool) {
+		for {
+			next, err := chunkerInst.Next(data)
+			if err == io.EOF {
+				return
+			} else if err != nil {
+				_ = yield(nil, fmt.Errorf("computing file chunk: %w", err))
+				return
+			}
+			if !yield(next.Data, nil) {
+				return
+			}
+		}
+	}
 }
