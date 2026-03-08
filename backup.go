@@ -198,6 +198,9 @@ func loadConfig(path string) (*Config, error) {
 	return cfg, nil
 }
 
+// TODO maybe use fastcdc or something if throughput becomes a bottleneck
+// here, e.g. restic/chunker uses rabin fingerprinting. don't expect this
+// to be an issue in most cases, only for large filesystems
 func chunkFile(rdr io.Reader) iter.Seq2[[]byte, error] {
 	const (
 		minChunkSize uint = 512 << 10
