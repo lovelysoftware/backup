@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"embed"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -10,15 +11,18 @@ import (
 	"iter"
 	"log"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 
 	"cloud.google.com/go/storage"
 	"github.com/BurntSushi/toml"
 	"github.com/restic/chunker"
 	"github.com/urfave/cli/v3"
 	"golang.org/x/sync/errgroup"
+	"google.golang.org/api/iterator"
 )
 
 //go:embed default-config.toml
@@ -84,6 +88,17 @@ func createBackup(ctx context.Context, cmd *cli.Command) error {
 		return errors.New("--cpus must be non-zero")
 	}
 	ignoreHidden := cmd.Bool("ignore-hidden")
+
+	storageClient, err := connectToGCS(ctx)
+	if err != nil {
+		return fmt.Errorf("connecting to gcs: %w", err)
+	}
+
+	packIndexes, err := loadPackIndexes(ctx, cfg, storageClient, cpus)
+	if err != nil {
+		return fmt.Errorf("loading existing pack indexes: %w", err)
+	}
+	log.Printf("loaded %d existing pack indexes", len(packIndexes))
 
 	eg := new(errgroup.Group)
 	eg.SetLimit(cpus)
@@ -195,6 +210,8 @@ func loadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("decoding config file: %w", err)
 	}
 
+	cfg.GCS.Prefix = strings.TrimSuffix(cfg.GCS.Prefix, "/")
+
 	return cfg, nil
 }
 
@@ -225,4 +242,72 @@ func chunkFile(rdr io.Reader) iter.Seq2[[]byte, error] {
 			}
 		}
 	}
+}
+
+type packIndexEntry struct {
+	Offset uint `json:"offset"`
+	Length uint `json:"length"`
+}
+
+type packIndex map[string]packIndexEntry
+
+type keyedPackIndex struct {
+	key   string
+	index packIndex
+}
+
+// list and download files matching <prefix>/indexes/<pack-id>.json,
+// which stores which blobs are in what pack file, and where in the file.
+func loadPackIndexes(
+	ctx context.Context,
+	cfg *Config,
+	client *storage.Client,
+	cpus int,
+) ([]keyedPackIndex, error) {
+	var (
+		prefix = fmt.Sprintf("%s/indexes/", cfg.GCS.Prefix)
+		bucket = client.Bucket(cfg.GCS.Bucket)
+		it     = bucket.Objects(ctx, &storage.Query{
+			Prefix:    prefix,
+			Delimiter: "/",
+		})
+		eg      = new(errgroup.Group)
+		mu      sync.Mutex // protects indexes
+		indexes []keyedPackIndex
+	)
+	eg.SetLimit(cpus)
+
+	for {
+		attrs, err := it.Next()
+		if err == iterator.Done {
+			break
+		} else if err != nil {
+			return nil, fmt.Errorf("listing pack indexes at prefix %s: %w", prefix, err)
+		}
+		eg.Go(func() error {
+			rdr, err := bucket.Object(attrs.Name).NewReader(ctx)
+			if err != nil {
+				return fmt.Errorf("reading %s: %w", attrs.Name, err)
+			}
+			defer rdr.Close()
+			var idxObject packIndex
+			if err := json.NewDecoder(rdr).Decode(&idxObject); err != nil {
+				return fmt.Errorf("unmarshaling %s: %w", attrs.Name, err)
+			}
+			kpi := keyedPackIndex{
+				key:   strings.TrimSuffix(path.Base(attrs.Name), ".json"),
+				index: idxObject,
+			}
+			mu.Lock()
+			indexes = append(indexes, kpi)
+			mu.Unlock()
+			return nil
+		})
+	}
+
+	if err := eg.Wait(); err != nil {
+		return nil, fmt.Errorf("downloading pack index: %w", err)
+	}
+
+	return indexes, nil
 }
