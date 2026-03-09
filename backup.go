@@ -161,7 +161,7 @@ func createBackup(ctx context.Context, cmd *cli.Command) error {
 }
 
 func connectToGCS(ctx context.Context) (*storage.Client, error) {
-	client, err := storage.NewGRPCClient(ctx)
+	client, err := storage.NewGRPCClient(ctx, storage.WithDisabledClientMetrics())
 	if err != nil {
 		return nil, fmt.Errorf("failed to create grpc client: %w", err)
 	}
@@ -173,9 +173,8 @@ type Config struct {
 }
 
 type GCSConfig struct {
-	ProjectID string `toml:"project_id"`
-	Bucket    string `toml:"bucket"`
-	Prefix    string `toml:"prefix,omitempty"`
+	Bucket string `toml:"bucket"`
+	Prefix string `toml:"prefix,omitempty"`
 }
 
 func chooseConfigPath() (string, error) {
