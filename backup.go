@@ -93,6 +93,7 @@ func createBackup(ctx context.Context, cmd *cli.Command) error {
 	if err != nil {
 		return fmt.Errorf("connecting to gcs: %w", err)
 	}
+	defer storageClient.Close()
 
 	packIndexes, err := loadPackIndexes(ctx, cfg, storageClient, cpus)
 	if err != nil {
