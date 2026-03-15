@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -15,6 +16,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"cloud.google.com/go/storage"
@@ -107,8 +109,30 @@ func createBackup(ctx context.Context, cmd *cli.Command) error {
 		len(existingBlobs),
 	)
 
+	hasExisting := func(sha string) bool {
+		_, ok := existingBlobs[sha]
+		return ok
+	}
+
+	var (
+		numTotalChunks atomic.Int64
+		numNewChunks   atomic.Int64
+	)
+
 	eg := new(errgroup.Group)
 	eg.SetLimit(cpus)
+
+	type newChunk struct {
+		hash    string
+		content []byte
+	}
+	newChunks := make(chan newChunk, cpus)
+
+	go func() {
+		for nc := range newChunks {
+			log.Printf("processing new chunk %s\n", nc.hash)
+		}
+	}()
 
 	for _, dir := range dirs {
 		abs, err := filepath.Abs(dir)
@@ -141,16 +165,32 @@ func createBackup(ctx context.Context, cmd *cli.Command) error {
 				}
 				defer f.Close()
 
-				var numChunks int
+				var (
+					totalc int64
+					newc   int64
+				)
 				for chk, err := range chunkFile(f) {
 					if err != nil {
 						return fmt.Errorf("chunking file %s: %w", path, err)
 					}
-					_ = chk
-					numChunks += 1
+					totalc += 1
+
+					hash := sha256Hash(chk)
+					if hasExisting(hash) {
+						continue
+					}
+					newc += 1
+
+					newChunks <- newChunk{
+						hash:    hash,
+						content: chk,
+					}
 				}
 
-				log.Printf("walking %s, found %d chunks\n", path, numChunks)
+				_ = numTotalChunks.Add(totalc)
+				_ = numNewChunks.Add(newc)
+
+				log.Printf("walking %s, found %d chunks (%d new)\n", path, totalc, newc)
 				return nil
 			})
 			return nil
@@ -162,8 +202,20 @@ func createBackup(ctx context.Context, cmd *cli.Command) error {
 	if err := eg.Wait(); err != nil {
 		return fmt.Errorf("chunking files: %w", err)
 	}
+	close(newChunks)
+
+	log.Printf(
+		"found %d new chunks, out of %d total chunks",
+		numNewChunks.Load(),
+		numTotalChunks.Load(),
+	)
 
 	return nil
+}
+
+func sha256Hash(b []byte) string {
+	h := sha256.Sum256(b)
+	return fmt.Sprintf("%x", h[:])
 }
 
 func connectToGCS(ctx context.Context) (*storage.Client, error) {
