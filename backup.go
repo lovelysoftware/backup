@@ -15,7 +15,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
+	"time"
 
 	"cloud.google.com/go/storage"
 	"github.com/BurntSushi/toml"
@@ -95,11 +95,17 @@ func createBackup(ctx context.Context, cmd *cli.Command) error {
 	}
 	defer storageClient.Close()
 
-	packIndexes, err := loadPackIndexes(ctx, cfg, storageClient, cpus)
+	start := time.Now()
+	packIndexes := loadPackIndexes(ctx, cfg, storageClient, cpus)
+	existingBlobs, err := buildExistingBlobSet(packIndexes)
 	if err != nil {
-		return fmt.Errorf("loading existing pack indexes: %w", err)
+		return fmt.Errorf("failed to build existing blob set: %w", err)
 	}
-	log.Printf("loaded %d existing pack indexes", len(packIndexes))
+	log.Printf(
+		"built existing blob set in %d ms, found %d blobs",
+		time.Since(start).Milliseconds(),
+		len(existingBlobs),
+	)
 
 	eg := new(errgroup.Group)
 	eg.SetLimit(cpus)
@@ -262,8 +268,8 @@ func loadPackIndexes(
 	ctx context.Context,
 	cfg *Config,
 	client *storage.Client,
-	cpus int,
-) ([]keyedPackIndex, error) {
+	concurrency int,
+) iter.Seq2[keyedPackIndex, error] {
 	var (
 		prefix = fmt.Sprintf("%s/indexes/", cfg.GCS.Prefix)
 		bucket = client.Bucket(cfg.GCS.Bucket)
@@ -271,43 +277,76 @@ func loadPackIndexes(
 			Prefix:    prefix,
 			Delimiter: "/",
 		})
-		eg      = new(errgroup.Group)
-		mu      sync.Mutex // protects indexes
-		indexes []keyedPackIndex
 	)
-	eg.SetLimit(cpus)
 
-	for {
-		attrs, err := it.Next()
-		if err == iterator.Done {
-			break
-		} else if err != nil {
-			return nil, fmt.Errorf("listing pack indexes at prefix %s: %w", prefix, err)
+	type packIndexOrErr struct {
+		kpi keyedPackIndex
+		err error
+	}
+
+	load := func(f string) packIndexOrErr {
+		rdr, err := bucket.Object(f).NewReader(ctx)
+		if err != nil {
+			return packIndexOrErr{err: fmt.Errorf("reading %s: %w", f, err)}
 		}
-		eg.Go(func() error {
-			rdr, err := bucket.Object(attrs.Name).NewReader(ctx)
-			if err != nil {
-				return fmt.Errorf("reading %s: %w", attrs.Name, err)
-			}
-			defer rdr.Close()
-			var idxObject packIndex
-			if err := json.NewDecoder(rdr).Decode(&idxObject); err != nil {
-				return fmt.Errorf("unmarshaling %s: %w", attrs.Name, err)
-			}
-			kpi := keyedPackIndex{
-				key:   strings.TrimSuffix(path.Base(attrs.Name), ".json"),
+		defer rdr.Close()
+		var idxObject packIndex
+		if err := json.NewDecoder(rdr).Decode(&idxObject); err != nil {
+			return packIndexOrErr{err: fmt.Errorf("unmarshaling %s: %w", f, err)}
+		}
+		return packIndexOrErr{
+			kpi: keyedPackIndex{
+				key:   strings.TrimSuffix(path.Base(f), ".json"),
 				index: idxObject,
+			},
+		}
+	}
+
+	c := make(chan packIndexOrErr)
+
+	go func() {
+		eg := new(errgroup.Group)
+		eg.SetLimit(concurrency)
+		for {
+			attrs, err := it.Next()
+			if err != nil {
+				if err != iterator.Done {
+					c <- packIndexOrErr{
+						err: fmt.Errorf("listing pack indexes at prefix %s: %w", prefix, err),
+					}
+				}
+				break
 			}
-			mu.Lock()
-			indexes = append(indexes, kpi)
-			mu.Unlock()
-			return nil
-		})
-	}
+			eg.Go(func() error {
+				c <- load(attrs.Name)
+				return nil
+			})
+		}
+		_ = eg.Wait()
+		close(c)
+	}()
 
-	if err := eg.Wait(); err != nil {
-		return nil, fmt.Errorf("downloading pack index: %w", err)
+	return func(yield func(keyedPackIndex, error) bool) {
+		for res := range c {
+			if !yield(res.kpi, res.err) {
+				return
+			}
+		}
 	}
+}
 
-	return indexes, nil
+// Using existing pack indicies, construct a set of all blobs we've seen so far.
+func buildExistingBlobSet(
+	packIndicies iter.Seq2[keyedPackIndex, error],
+) (map[string]struct{}, error) {
+	m := make(map[string]struct{})
+	for kpi, err := range packIndicies {
+		if err != nil {
+			return nil, err
+		}
+		for sha := range kpi.index {
+			m[sha] = struct{}{}
+		}
+	}
+	return m, nil
 }
